@@ -1,0 +1,32 @@
+# Environment variables — never commit secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Model weights — too large for git, use git-lfs or cloud storage
+model/tcn_cognitive_load.pth
+model/*.pth
+model/*.pt
+
+# WESAD dataset — raw data stays local
+data/
+WESAD/
+
+# macOS
+.DS_Store
+
+# Docker
+docker-compose.override.yml
+
+# IDE
+.vscode/
+.idea/
+*.swp
