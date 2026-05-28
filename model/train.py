@@ -1,38 +1,39 @@
 """
-train.py — Train the TCN cognitive-load classifier on WESAD.
+train.py — Train the TCN cognitive-load classifier on WESAD with LOSO evaluation.
 
 Usage
 -----
-  # From the model/ directory, with your virtual env active:
   python train.py --wesad_root /path/to/WESAD
 
   # Optional overrides:
-  python train.py --wesad_root /path/to/WESAD --epochs 80 --lr 5e-4 --batch_size 32
+  python train.py --wesad_root /path/to/WESAD --epochs 80 --lr 5e-4
+
+Evaluation strategy
+-------------------
+  Leave-One-Subject-Out (LOSO) cross-validation:
+    For each of the N subjects, train on the remaining N-1 subjects and
+    evaluate on the held-out one.  This is the correct evaluation for
+    physiological signal models because EDA and BVP are highly person-specific.
+    A random window-level split leaks subject identity into the test set,
+    making the reported numbers optimistic.
+
+  After LOSO, a final model is trained on ALL subjects and saved as the
+  deployment checkpoint.  LOSO gives the honest generalisation estimate;
+  the final model benefits from the full dataset.
+
+  Within each fold, 15% of the training windows are held out as a validation
+  set for early stopping.  This validation set is sampled from the training
+  subjects only — never from the held-out subject.
 
 Output
 ------
-  tcn_cognitive_load.pth  — best checkpoint (saved whenever val F1 improves)
+  tcn_cognitive_load.pth  — final model trained on all subjects
 
   Checkpoint contents:
-    model_state_dict  : weights, loadable into TCN(**model_config)
-    model_config      : dict of TCN constructor kwargs (no need to hard-code)
-    global_stats      : {"mean": (2,), "std": (2,)} — per-channel normalisation
-                        stats computed over the full corpus.
-                        Used at inference when no session baseline is available.
-
-Normalisation note
-------------------
-  Windows are per-subject z-scored in dataset.py before they reach this script.
-  'global_stats' are statistics OF those already-normalised windows — they
-  describe the distribution of the normalised data and serve as a consistent
-  reference frame for the inference service.
-
-Split strategy
---------------
-  Stratified random split (75/15/10 train/val/test) at the window level.
-  A true leave-one-subject-out (LOSO) split would give a better estimate of
-  generalisation to new users, but requires more subjects than the demo setup.
-  The split here is sufficient to validate convergence and avoid overfitting.
+    model_state_dict : weights, loadable into TCN(**model_config)
+    model_config     : dict of TCN constructor kwargs
+    global_stats     : {"mean": (2,), "std": (2,)} normalisation fallback
+    loso_summary     : {"mean_f1": float, "std_f1": float, "per_fold": list}
 """
 
 import argparse
@@ -51,18 +52,25 @@ from tcn_arch import TCN
 
 
 # ---------------------------------------------------------------------------
-# Hyper-parameters (override via CLI args)
+# Defaults
 # ---------------------------------------------------------------------------
 
 DEFAULTS = dict(
-    epochs      = 60,
-    batch_size  = 64,
-    lr          = 1e-3,
-    weight_decay= 1e-4,
-    dropout     = 0.2,
-    patience    = 10,           # early-stopping patience (epochs)
-    seed        = 42,
-    out         = "tcn_cognitive_load.pth",
+    epochs       = 60,
+    batch_size   = 64,
+    lr           = 1e-3,
+    weight_decay = 1e-4,
+    dropout      = 0.2,
+    patience     = 10,
+    seed         = 42,
+    out          = "tcn_cognitive_load.pth",
+)
+
+MODEL_CFG = dict(
+    input_channels = 2,
+    num_classes    = 2,
+    channel_sizes  = [32, 64, 64, 128],
+    kernel_size    = 3,
 )
 
 
@@ -86,60 +94,248 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-def class_weights(y_train: np.ndarray, device: torch.device) -> torch.Tensor:
-    """Inverse-frequency weights to handle baseline/stress imbalance."""
-    counts = np.bincount(y_train)
+def make_criterion(y_train: np.ndarray, device: torch.device) -> nn.CrossEntropyLoss:
+    counts  = np.bincount(y_train)
     weights = 1.0 / counts.astype(float)
-    weights /= weights.sum()          # normalise so they sum to 1
-    return torch.tensor(weights, dtype=torch.float32, device=device)
+    weights /= weights.sum()
+    return nn.CrossEntropyLoss(
+        weight=torch.tensor(weights, dtype=torch.float32, device=device)
+    )
+
+
+def make_loader(X, y, batch_size, shuffle):
+    return DataLoader(
+        WESADDataset(X, y),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=0,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Train / eval loops
+# Single epoch train / eval
 # ---------------------------------------------------------------------------
 
-def train_one_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    criterion: nn.Module,
-    device: torch.device,
-) -> float:
+def train_one_epoch(model, loader, optimizer, criterion, device):
     model.train()
-    running_loss = 0.0
+    total = 0.0
     for X, y in loader:
         X, y = X.to(device), y.to(device)
         optimizer.zero_grad()
         loss = criterion(model(X), y)
         loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-        running_loss += loss.item() * len(y)
-    return running_loss / len(loader.dataset)
+        total += loss.item() * len(y)
+    return total / len(loader.dataset)
 
 
 @torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-) -> tuple[float, float, float]:
+def evaluate(model, loader, criterion, device):
     model.eval()
-    total_loss = 0.0
-    all_preds, all_labels = [], []
-
+    total, preds, labels = 0.0, [], []
     for X, y in loader:
         X, y = X.to(device), y.to(device)
         logits = model(X)
-        total_loss += criterion(logits, y).item() * len(y)
-        all_preds.extend(logits.argmax(dim=1).cpu().numpy())
-        all_labels.extend(y.cpu().numpy())
-
-    loss = total_loss / len(loader.dataset)
-    acc  = accuracy_score(all_labels, all_preds)
-    f1   = f1_score(all_labels, all_preds, average="binary", pos_label=1)
+        total += criterion(logits, y).item() * len(y)
+        preds.extend(logits.argmax(1).cpu().numpy())
+        labels.extend(y.cpu().numpy())
+    loss = total / len(loader.dataset)
+    acc  = accuracy_score(labels, preds)
+    f1   = f1_score(labels, preds, average="binary", pos_label=1)
     return loss, acc, f1
+
+
+# ---------------------------------------------------------------------------
+# Core training loop (reused by both LOSO folds and the final model)
+# ---------------------------------------------------------------------------
+
+def train_model(
+    X_tr, y_tr,
+    X_vl, y_vl,
+    args,
+    device,
+    verbose: bool = False,
+) -> tuple:
+    """
+    Train a fresh TCN on (X_tr, y_tr), validate on (X_vl, y_vl).
+    Returns (best_model_state_dict, best_val_f1).
+    """
+    model_cfg = {**MODEL_CFG, "dropout": args.dropout}
+    model     = TCN(**model_cfg).to(device)
+    criterion = make_criterion(y_tr, device)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=4
+    )
+
+    tr_loader = make_loader(X_tr, y_tr, args.batch_size, shuffle=True)
+    vl_loader = make_loader(X_vl, y_vl, args.batch_size, shuffle=False)
+
+    best_f1, best_state, patience_ctr = 0.0, None, 0
+
+    for epoch in range(1, args.epochs + 1):
+        tr_loss             = train_one_epoch(model, tr_loader, optimizer, criterion, device)
+        vl_loss, vl_acc, vl_f1 = evaluate(model, vl_loader, criterion, device)
+        scheduler.step(vl_f1)
+
+        if verbose:
+            marker = " ✓" if vl_f1 > best_f1 else ""
+            print(
+                f"  epoch {epoch:3d} | "
+                f"tr={tr_loss:.4f}  vl={vl_loss:.4f}  "
+                f"acc={vl_acc:.3f}  f1={vl_f1:.3f}{marker}"
+            )
+
+        if vl_f1 > best_f1:
+            best_f1    = vl_f1
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            patience_ctr = 0
+        else:
+            patience_ctr += 1
+            if patience_ctr >= args.patience:
+                if verbose:
+                    print(f"  Early stopping at epoch {epoch}.")
+                break
+
+    return best_state, best_f1
+
+
+# ---------------------------------------------------------------------------
+# LOSO cross-validation
+# ---------------------------------------------------------------------------
+
+def run_loso(X, y, subject_ids, args, device) -> list:
+    """
+    Leave-One-Subject-Out cross-validation.
+
+    For each unique subject:
+      - Hold out all windows belonging to that subject as the test set.
+      - Train on the remaining subjects (with an internal 85/15 val split
+        for early stopping).
+      - Record acc and F1 on the held-out subject.
+
+    Returns a list of per-fold dicts.
+    """
+    unique_subjects = np.unique(subject_ids)
+    n_folds         = len(unique_subjects)
+    fold_results    = []
+
+    print(f"\n{'='*60}")
+    print(f"LOSO Cross-Validation  ({n_folds} folds)")
+    print(f"{'='*60}")
+
+    for fold_i, held_out in enumerate(unique_subjects):
+        tr_pool_idx = np.where(subject_ids != held_out)[0]
+        ts_idx      = np.where(subject_ids == held_out)[0]
+
+        # Internal train/val split (85/15) within the training subjects
+        tr_idx, vl_idx = train_test_split(
+            tr_pool_idx,
+            test_size=0.15,
+            stratify=y[tr_pool_idx],
+            random_state=args.seed,
+        )
+
+        print(
+            f"\nFold {fold_i+1:2d}/{n_folds} | "
+            f"held-out subject idx={held_out} | "
+            f"train={len(tr_idx)}  val={len(vl_idx)}  test={len(ts_idx)}"
+        )
+
+        best_state, best_vl_f1 = train_model(
+            X[tr_idx], y[tr_idx],
+            X[vl_idx], y[vl_idx],
+            args, device,
+            verbose=False,   # keep LOSO output compact
+        )
+
+        # Evaluate on held-out subject
+        model_cfg = {**MODEL_CFG, "dropout": args.dropout}
+        model     = TCN(**model_cfg).to(device)
+        model.load_state_dict(best_state)
+        criterion = make_criterion(y[tr_idx], device)
+        ts_loader = make_loader(X[ts_idx], y[ts_idx], args.batch_size, shuffle=False)
+        _, ts_acc, ts_f1 = evaluate(model, ts_loader, criterion, device)
+
+        print(
+            f"         result     | val_f1={best_vl_f1:.3f}  "
+            f"test_acc={ts_acc:.3f}  test_f1={ts_f1:.3f}"
+        )
+        fold_results.append({
+            "subject_idx": int(held_out),
+            "test_acc":    round(ts_acc, 4),
+            "test_f1":     round(ts_f1,  4),
+            "val_f1":      round(best_vl_f1, 4),
+        })
+
+    # Summary
+    f1_scores = [r["test_f1"] for r in fold_results]
+    ac_scores = [r["test_acc"] for r in fold_results]
+    mean_f1   = float(np.mean(f1_scores))
+    std_f1    = float(np.std(f1_scores))
+    mean_acc  = float(np.mean(ac_scores))
+
+    print(f"\n{'='*60}")
+    print(f"LOSO Summary")
+    print(f"  mean F1  : {mean_f1:.3f} ± {std_f1:.3f}")
+    print(f"  mean acc : {mean_acc:.3f}")
+    print(f"  worst F1 : {min(f1_scores):.3f}  (subject idx={f1_scores.index(min(f1_scores))})")
+    print(f"  best  F1 : {max(f1_scores):.3f}  (subject idx={f1_scores.index(max(f1_scores))})")
+    print(f"{'='*60}\n")
+
+    return fold_results
+
+
+# ---------------------------------------------------------------------------
+# Final model — trained on ALL subjects
+# ---------------------------------------------------------------------------
+
+def train_final_model(X, y, global_stats, fold_results, args, device) -> None:
+    """
+    Train the deployment model on all subjects.
+    Uses a small internal val split (10%) for early stopping only.
+    Saves to args.out.
+    """
+    print("Training final model on all subjects ...")
+
+    tr_idx, vl_idx = train_test_split(
+        np.arange(len(y)),
+        test_size=0.10,
+        stratify=y,
+        random_state=args.seed,
+    )
+
+    best_state, best_vl_f1 = train_model(
+        X[tr_idx], y[tr_idx],
+        X[vl_idx], y[vl_idx],
+        args, device,
+        verbose=True,
+    )
+
+    loso_summary = {
+        "mean_f1":  round(float(np.mean([r["test_f1"]  for r in fold_results])), 4),
+        "std_f1":   round(float(np.std( [r["test_f1"]  for r in fold_results])), 4),
+        "mean_acc": round(float(np.mean([r["test_acc"] for r in fold_results])), 4),
+        "per_fold": fold_results,
+    }
+
+    model_cfg = {**MODEL_CFG, "dropout": args.dropout}
+    torch.save(
+        {
+            "model_state_dict": best_state,
+            "model_config":     model_cfg,
+            "global_stats":     global_stats,
+            "loso_summary":     loso_summary,
+        },
+        args.out,
+    )
+
+    print(f"\nCheckpoint saved → {Path(args.out).resolve()}")
+    print(f"  val_f1 (final model) : {best_vl_f1:.3f}")
+    print(f"  LOSO mean_f1         : {loso_summary['mean_f1']:.3f} ± {loso_summary['std_f1']:.3f}")
 
 
 # ---------------------------------------------------------------------------
@@ -149,130 +345,21 @@ def evaluate(
 def main(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     device = get_device()
+
     print(f"\n{'='*60}")
     print(f"Device     : {device}")
     print(f"WESAD root : {args.wesad_root}")
     print(f"Output     : {args.out}")
-    print(f"{'='*60}\n")
+    print(f"{'='*60}")
 
-    # ------------------------------------------------------------------
-    # 1. Load and window the dataset
-    # ------------------------------------------------------------------
-    print("Building windows from WESAD dataset...")
-    X, y, global_stats = build_windows(args.wesad_root)
+    print("\nBuilding windows from WESAD dataset ...")
+    X, y, subject_ids, global_stats = build_windows(args.wesad_root)
 
-    # ------------------------------------------------------------------
-    # 2. Stratified split (window level)
-    # ------------------------------------------------------------------
-    idx = np.arange(len(y))
+    # 1. LOSO: honest generalisation estimate
+    fold_results = run_loso(X, y, subject_ids, args, device)
 
-    # 75% train, 15% val, 10% test
-    tr_idx, tmp_idx = train_test_split(
-        idx, test_size=0.25, stratify=y, random_state=args.seed
-    )
-    vl_idx, ts_idx = train_test_split(
-        tmp_idx, test_size=0.40, stratify=y[tmp_idx], random_state=args.seed
-    )
-
-    print(f"\nSplit  →  train: {len(tr_idx)}  val: {len(vl_idx)}  test: {len(ts_idx)}")
-
-    tr_loader = DataLoader(
-        WESADDataset(X[tr_idx], y[tr_idx]),
-        batch_size=args.batch_size, shuffle=True,  num_workers=0, pin_memory=False
-    )
-    vl_loader = DataLoader(
-        WESADDataset(X[vl_idx], y[vl_idx]),
-        batch_size=args.batch_size, shuffle=False, num_workers=0
-    )
-    ts_loader = DataLoader(
-        WESADDataset(X[ts_idx], y[ts_idx]),
-        batch_size=args.batch_size, shuffle=False, num_workers=0
-    )
-
-    # ------------------------------------------------------------------
-    # 3. Model, loss, optimiser
-    # ------------------------------------------------------------------
-    model_cfg = dict(
-        input_channels = 2,
-        num_classes    = 2,
-        channel_sizes  = [32, 64, 64, 128],
-        kernel_size    = 3,
-        dropout        = args.dropout,
-    )
-    model     = TCN(**model_cfg).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights(y[tr_idx], device))
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
-    )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=4
-    )
-
-    param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters : {param_count:,}\n")
-
-    # ------------------------------------------------------------------
-    # 4. Training loop with early stopping on val F1
-    # ------------------------------------------------------------------
-    best_val_f1   = 0.0
-    patience_ctr  = 0
-    header_printed = False
-
-    for epoch in range(1, args.epochs + 1):
-        tr_loss             = train_one_epoch(model, tr_loader, optimizer, criterion, device)
-        vl_loss, vl_acc, vl_f1 = evaluate(model, vl_loader, criterion, device)
-        scheduler.step(vl_f1)
-
-        if not header_printed:
-            print(f"{'Epoch':>6}  {'tr_loss':>9}  {'vl_loss':>9}  {'vl_acc':>7}  {'vl_f1':>7}")
-            print("-" * 52)
-            header_printed = True
-
-        marker = " ✓" if vl_f1 > best_val_f1 else ""
-        print(
-            f"{epoch:6d}  {tr_loss:9.4f}  {vl_loss:9.4f}  "
-            f"{vl_acc:7.3f}  {vl_f1:7.3f}{marker}"
-        )
-
-        if vl_f1 > best_val_f1:
-            best_val_f1  = vl_f1
-            patience_ctr = 0
-            torch.save(
-                {
-                    "model_state_dict" : model.state_dict(),
-                    "model_config"     : model_cfg,
-                    "global_stats"     : global_stats,   # for inference fallback
-                },
-                args.out,
-            )
-        else:
-            patience_ctr += 1
-            if patience_ctr >= args.patience:
-                print(f"\nEarly stopping at epoch {epoch} (no val F1 improvement for {args.patience} epochs).")
-                break
-
-    # ------------------------------------------------------------------
-    # 5. Final test evaluation using the best checkpoint
-    # ------------------------------------------------------------------
-    print(f"\nLoading best checkpoint from '{args.out}' ...")
-    ckpt = torch.load(args.out, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
-
-    ts_loss, ts_acc, ts_f1 = evaluate(model, ts_loader, criterion, device)
-    print(f"\n{'='*60}")
-    print(f"Test  →  loss={ts_loss:.4f}  acc={ts_acc:.3f}  f1={ts_f1:.3f}")
-    print(f"{'='*60}\n")
-
-    # Detailed per-class report
-    model.eval()
-    all_preds, all_labels = [], []
-    with torch.no_grad():
-        for X, y_batch in ts_loader:
-            all_preds.extend(model(X.to(device)).argmax(1).cpu().numpy())
-            all_labels.extend(y_batch.numpy())
-    print(classification_report(all_labels, all_preds,
-                                 target_names=["baseline", "stress"]))
-    print(f"Checkpoint saved to  : {Path(args.out).resolve()}")
+    # 2. Final model: trained on all subjects for deployment
+    train_final_model(X, y, global_stats, fold_results, args, device)
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +368,7 @@ def main(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Train TCN cognitive-load classifier on WESAD dataset."
+        description="Train TCN on WESAD with LOSO cross-validation."
     )
     parser.add_argument(
         "--wesad_root", required=True,
@@ -294,6 +381,5 @@ if __name__ == "__main__":
     parser.add_argument("--dropout",      type=float, default=DEFAULTS["dropout"])
     parser.add_argument("--patience",     type=int,   default=DEFAULTS["patience"])
     parser.add_argument("--seed",         type=int,   default=DEFAULTS["seed"])
-    parser.add_argument("--out",          type=str,   default=DEFAULTS["out"],
-                        help="Output path for the model checkpoint.")
+    parser.add_argument("--out",          type=str,   default=DEFAULTS["out"])
     main(parser.parse_args())
